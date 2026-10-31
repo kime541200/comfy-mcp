@@ -71,6 +71,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -78,13 +79,16 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, NamedTuple
+from pathlib import Path
+from typing import Any, Literal, NamedTuple
 from urllib.parse import urlparse
 
 import anyio.to_thread
 from mcp import types
 from mcp.server.mcpserver import Context, Image, MCPServer
 from pydantic import BaseModel, Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 
 from . import (
     argv,
@@ -4163,6 +4167,7 @@ async def run_workflow(
     # that verbatim), so this is input hygiene, not injection defense — see
     # `argv._reject_option_like`.
     argv._guard_workflow_path(workflow_path)
+    workflow_path = _resolve_container_path(workflow_path)
     if not workflow_path.strip():
         # Before the consent gate below, deliberately: an empty path cannot
         # possibly spend, and comfy-cli will reject it anyway, so raising a
@@ -11368,6 +11373,7 @@ async def workflow_deps(workflow_path: str) -> Any:
     # (or prints `--help`) that fails envelope parsing, and a named error beats
     # that. NOT injection defence — Click takes an option value verbatim.
     argv._guard_workflow_path(workflow_path)
+    workflow_path = _resolve_container_path(workflow_path)
     if not workflow_path.strip():
         # Same explicit emptiness check `run_workflow` makes, so the two
         # workflow-taking tools answer an empty path the same way. The shared
@@ -12628,6 +12634,7 @@ def validate_workflow(workflow_path: str) -> Any:
     # `filename` make. A dash-leading path reaches comfy-cli as a usage error (or
     # prints `--help`) that fails envelope parsing; a named error is better.
     argv._guard_workflow_path(workflow_path)
+    workflow_path = _resolve_container_path(workflow_path)
     try:
         result = _run_comfy("validate", "--workflow", workflow_path, timeout=60.0)
     except ComfyCliError as exc:
@@ -12676,6 +12683,84 @@ def validate_workflow(workflow_path: str) -> Any:
     if report is None:
         return _bounded_report_value(result)
     return _relayed_validation_report(report)
+
+
+def _resolve_container_path(path_str: str) -> str:
+    """Translate a host or relative workflow path to a container-mounted path if needed."""
+    cleaned = path_str.strip()
+    if not cleaned or os.path.exists(cleaned):
+        return path_str
+    wf_dir = os.environ.get("WORKFLOW_DIR", "").strip()
+    if not wf_dir:
+        return path_str
+    host_dir = os.environ.get("WORKFLOW_HOST_DIR", "").strip()
+    p = Path(cleaned)
+    if host_dir:
+        try:
+            rel = p.relative_to(Path(host_dir))
+            candidate = Path(wf_dir) / rel
+            if candidate.exists():
+                return str(candidate)
+        except ValueError:
+            pass
+    candidate = Path(wf_dir) / p.name
+    if candidate.exists():
+        return str(candidate)
+    return path_str
+
+
+def _write_inline_workflow(workflow: dict[str, Any] | str) -> str:
+    """Persist an inline workflow JSON dict or string to a temporary file for comfy-cli."""
+    if isinstance(workflow, str):
+        try:
+            parsed = json.loads(workflow)
+        except json.JSONDecodeError as exc:
+            raise ComfyCliError(f"workflow is not valid JSON: {exc}") from exc
+    elif isinstance(workflow, dict):
+        parsed = workflow
+    else:
+        raise ComfyCliError("workflow must be a JSON object (dict) or JSON string.")
+    if not isinstance(parsed, dict) or not parsed:
+        raise ComfyCliError("workflow must be a non-empty JSON object.")
+
+    base_dir = Path(os.environ.get("WORKFLOW_DIR") or tempfile.gettempdir())
+    base_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix="comfy_mcp_inline_", suffix=".json", dir=str(base_dir)
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(parsed, f, ensure_ascii=False, indent=2)
+    return tmp_path
+
+
+@mcp.tool()
+def validate_workflow_json(workflow: dict[str, Any] | str) -> Any:
+    """Pre-flight an inline ComfyUI workflow JSON object (or JSON string) without needing a shared filesystem path."""
+    tmp_path = _write_inline_workflow(workflow)
+    try:
+        return validate_workflow(tmp_path)
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
+
+
+@mcp.tool()
+async def run_workflow_json(
+    workflow: dict[str, Any] | str,
+    wait: bool = True,
+    timeout_seconds: float = 110.0,
+    confirm_spend: bool = False,
+    ctx: Context | None = None,
+) -> Any:
+    """Run an inline ComfyUI workflow JSON object (or JSON string) without needing a shared filesystem path."""
+    tmp_path = _write_inline_workflow(workflow)
+    return await run_workflow(
+        workflow_path=tmp_path,
+        wait=wait,
+        timeout_seconds=timeout_seconds,
+        confirm_spend=confirm_spend,
+        ctx=ctx,
+    )
 
 
 def _slot_pairing_is_broken(slot: Any) -> bool:
@@ -13237,65 +13322,154 @@ def _warm_template_gallery() -> None:
             return
 
 
-def main(args: list[str] | None = None) -> None:
-    """Entry point: answer ``--help`` / ``--version``, else serve over stdio.
+_BRIDGED_COMFYUI_URL: str | None = None
 
-    ``args`` defaults to the process's arguments and exists so a test can drive
-    the entry point without rewriting ``sys.argv``; the console script calls
-    this with none. It is a ``list``, not a ``Sequence``, because a bare ``str``
-    satisfies ``Sequence[str]`` and would be read character by character, which
-    :func:`cli._handle_argv` rejects outright. Only the two human-facing flags
-    are intercepted (see that function) — every other argument still falls
-    through to the server exactly as it did when argv was ignored outright.
 
-    A macOS protected-folder denial hit during startup (a config, log, or module
-    the server itself reads from under ~/Documents, say) arrives as a bare
-    :class:`PermissionError` that the MCP client would surface as a raw Python
-    traceback. Translate it into the same actionable guidance the tool paths
-    give, on stderr — where MCP clients collect server logs — and exit non-zero.
-    Anything else propagates unchanged.
-
-    One case is beyond reach on purpose: if THIS server's own interpreter cannot
-    read its venv, CPython dies in ``init_import_site`` before any of our code
-    runs. That failure is only catchable from the parent side, which is exactly
-    what the ``comfy``-binary guards in :func:`_check_comfy_version` and
-    :func:`_require_comfy_bin` do for the child process we spawn.
-    """
+def _pipe_sockets(src: socket.socket, dst: socket.socket) -> None:
     try:
-        # First thing in the body — before the startup probing below, which
-        # shells out and can be slow — because a human asking what this program
-        # is should get an answer that does not depend on the state of their
-        # install. Inside the `try` rather than above it because reading the
-        # version out of installed metadata walks `sys.path`, so it is one more
-        # startup read a protected-folder denial can land on, and it deserves
-        # the same translated guidance as the rest.
-        if cli._handle_argv(sys.argv[1:] if args is None else args, _MIN_COMFY_CLI_STR):
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            dst.shutdown(socket.SHUT_WR)
+
+
+def _start_local_comfy_bridge(target_url: str) -> str | None:
+    """Bind 127.0.0.1:8188 locally and forward to target_url so comfy-cli's loopback-only verbs work in Docker."""
+    parsed = urlparse(target_url if "://" in target_url else f"http://{target_url}")
+    upstream_host = parsed.hostname
+    upstream_port = parsed.port or 8188
+    if not upstream_host:
+        return None
+    if upstream_host in ("127.0.0.1", "localhost", "::1") and upstream_port == 8188:
+        return None
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind(("127.0.0.1", 8188))
+    except OSError:
+        srv.close()
+        return None
+    srv.listen(64)
+
+    def _handle_client(client_sock: socket.socket) -> None:
+        try:
+            up_sock = socket.create_connection(
+                (upstream_host, upstream_port), timeout=10.0
+            )
+            up_sock.settimeout(None)
+        except OSError:
+            client_sock.close()
             return
-        # Before serving: enrich the handshake instructions with the one-shot
-        # machine snapshot. Runs inside this try on purpose — the
-        # probe swallows its own failures (including a PermissionError, an
-        # OSError subclass) and falls open, so nothing here can keep the
-        # server from starting.
+        t1 = threading.Thread(
+            target=_pipe_sockets, args=(client_sock, up_sock), daemon=True
+        )
+        t2 = threading.Thread(
+            target=_pipe_sockets, args=(up_sock, client_sock), daemon=True
+        )
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        client_sock.close()
+        up_sock.close()
+
+    def _accept_loop() -> None:
+        while True:
+            try:
+                c, _ = srv.accept()
+                threading.Thread(
+                    target=_handle_client, args=(c,), daemon=True
+                ).start()
+            except OSError:
+                break
+
+    threading.Thread(
+        target=_accept_loop, name="comfy-mcp-local-bridge", daemon=True
+    ).start()
+    return f"http://{upstream_host}:{upstream_port}"
+
+
+@mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
+async def health_check(_request: Request) -> Response:
+    return JSONResponse(
+        {
+            "status": "ok",
+            "service": "comfy-mcp",
+            "comfyui_url": _BRIDGED_COMFYUI_URL
+            or os.environ.get("COMFYUI_URL")
+            or os.environ.get("COMFY_LOCAL_URL")
+            or "http://127.0.0.1:8188",
+        }
+    )
+
+
+def main(args: list[str] | None = None) -> None:
+    """Entry point: answer ``--help`` / ``--version``, else serve over stdio or streamable-http."""
+    global _BRIDGED_COMFYUI_URL
+    try:
+        raw_argv = sys.argv[1:] if args is None else list(args)
+        transport_val = os.environ.get("MCP_TRANSPORT", "stdio").strip()
+        host_val = os.environ.get("MCP_HOST", "0.0.0.0").strip()
+        port_val = int(os.environ.get("MCP_PORT", "8000"))
+        path_val = os.environ.get("MCP_PATH", "/mcp").strip()
+
+        # Extract optional transport flags before passing remaining argv to cli._handle_argv
+        filtered_argv: list[str] = []
+        i = 0
+        while i < len(raw_argv):
+            tok = raw_argv[i]
+            if tok == "--transport" and i + 1 < len(raw_argv):
+                transport_val = raw_argv[i + 1]
+                i += 2
+            elif tok.startswith("--transport="):
+                transport_val = tok.split("=", 1)[1]
+                i += 1
+            elif tok == "--host" and i + 1 < len(raw_argv):
+                host_val = raw_argv[i + 1]
+                i += 2
+            elif tok.startswith("--host="):
+                host_val = tok.split("=", 1)[1]
+                i += 1
+            elif tok == "--port" and i + 1 < len(raw_argv):
+                port_val = int(raw_argv[i + 1])
+                i += 2
+            elif tok.startswith("--port="):
+                port_val = int(tok.split("=", 1)[1])
+                i += 1
+            elif tok == "--path" and i + 1 < len(raw_argv):
+                path_val = raw_argv[i + 1]
+                i += 2
+            elif tok.startswith("--path="):
+                path_val = tok.split("=", 1)[1]
+                i += 1
+            else:
+                filtered_argv.append(tok)
+                i += 1
+
+        if cli._handle_argv(filtered_argv, _MIN_COMFY_CLI_STR):
+            return
+
+        if transport_val in ("streamable-http", "sse"):
+            configured_url = (
+                os.environ.get("COMFYUI_URL")
+                or os.environ.get("COMFY_LOCAL_URL")
+                or ""
+            ).strip()
+            if configured_url:
+                bridged = _start_local_comfy_bridge(configured_url)
+                if bridged:
+                    _BRIDGED_COMFYUI_URL = bridged
+                    os.environ.pop("COMFYUI_URL", None)
+                    os.environ.pop("COMFY_LOCAL_URL", None)
+
         _apply_startup_instructions()
-        # Then warm comfy-cli's template gallery cache off the request path.
-        # Started and never joined: unlike the snapshot probe above there is no
-        # result to collect, so there is nothing to wait for and this can never
-        # delay the initialize response.
-        #
-        # It therefore runs CONCURRENTLY with two things. With the snapshot
-        # probe, whenever that probe outlived its bounded join: both funnel
-        # through `_check_comfy_version`, and its shared `_version_checked`
-        # flag is read and written without a lock, so a race there can latch
-        # the fail-open verdict early — which is the same outcome that guard
-        # already documents for a hung or unreadable `--version`, and it is
-        # fail-OPEN by design in all four of its other branches too. And with
-        # the REQUEST path: a client that calls `search_templates` immediately
-        # after `initialize` gets a second comfy-cli that also sees an absent
-        # cache and fetches, so both write comfy-cli's `index.json`. Nothing
-        # here coordinates that, deliberately — the cache and the atomicity of
-        # its write belong to comfy-cli (AGENTS.md: no product behavior in this
-        # repo), and the caller's worst case is what it already pays today, one
-        # synchronous fetch, plus a redundant background one.
         try:
             threading.Thread(
                 target=_warm_template_gallery,
@@ -13303,18 +13477,20 @@ def main(args: list[str] | None = None) -> None:
                 daemon=True,
             ).start()
         except RuntimeError:
-            # "can't start new thread" under thread/resource exhaustion. A warm
-            # that is best-effort in every other direction must not be the one
-            # thing that aborts startup: skipping it costs only the cold first
-            # `search_templates` the caller would have paid anyway. Narrow on
-            # purpose — anything else here is a real bug, not a warm we can drop.
             pass
-        # Name the transport rather than inheriting the SDK's default: the whole
-        # stdio design rests on it — `failure_log`'s rule that stdout is the
-        # JSON-RPC channel and must never be written to is only true under
-        # stdio. 2.x defaults to "stdio" today, but a default is a thing a
-        # future SDK is free to change, and this one is load-bearing.
-        mcp.run(transport="stdio")
+
+        transport: Literal["stdio", "sse", "streamable-http"] = transport_val  # type: ignore[assignment]
+        if transport == "streamable-http":
+            mcp.run(
+                transport="streamable-http",
+                host=host_val,
+                port=port_val,
+                streamable_http_path=path_val,
+            )
+        elif transport == "sse":
+            mcp.run(transport="sse", host=host_val, port=port_val)
+        else:
+            mcp.run(transport="stdio")
     except PermissionError as exc:
         # Prefer the exception's structured `filename` over re-parsing its text:
         # it is the authoritative path, and it is present for errnos the text

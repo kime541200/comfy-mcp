@@ -50,6 +50,33 @@ here; it breaks the next release's registry publish.
 > Looking for the cloud-hosted version? [Comfy Cloud MCP](#comfy-cloud-mcp) is set up below — install
 > it instead of this server, or alongside it.
 
+## Docker & Streamable HTTP Deployment (Fork Extensions)
+
+This fork ([kime541200/comfy-mcp](https://github.com/kime541200/comfy-mcp)) extends upstream `comfy-mcp` with **Docker deployment**, **`streamable-http` transport** (`http://127.0.0.1:8091/mcp`), a `/health` endpoint, an internal `comfy-cli` workspace (so no host stub directory is needed), and inline JSON tools (`validate_workflow_json` / `run_workflow_json`).
+
+```bash
+cp .env.example .env
+# Edit .env to adjust PORT, COMFYUI_URL, COMFYUI_MODELS_DIR, etc.
+docker compose up -d --build
+curl -s http://127.0.0.1:8091/health
+```
+
+Add to your Agent's `mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "comfyui-local": {
+      "url": "http://127.0.0.1:8091/mcp"
+    }
+  }
+}
+```
+
+For a ready-to-use Agent Studio workspace with pre-built ComfyUI workflow templates, see [kime541200/comfyui-agent](https://github.com/kime541200/comfyui-agent). For Dockerized ComfyUI deployment, see [kime541200/comfyui-deploy](https://github.com/kime541200/comfyui-deploy).
+
+---
+
 **What it does:**
 
 - 🖼️ **Generate** — run a workflow JSON (API-format or UI export), or go text-prompt → image in one call.
